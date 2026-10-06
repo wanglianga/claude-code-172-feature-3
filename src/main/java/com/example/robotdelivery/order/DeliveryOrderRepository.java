@@ -23,4 +23,8 @@ public interface DeliveryOrderRepository
             Collection<DeliveryStatus> excludedStatuses, LocalDateTime deadlineBefore);
 
     long countByCommunityId(Long communityId);
+
+    List<DeliveryOrder> findByCommunityIdAndStatusIn(Long communityId, Collection<DeliveryStatus> statuses);
+
+    List<DeliveryOrder> findByCommunityIdAndNightExitRequiredTrue(Long communityId);
 }

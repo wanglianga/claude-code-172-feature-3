@@ -14,6 +14,7 @@ import com.example.robotdelivery.notification.NotificationService;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
+import com.example.robotdelivery.order.FulfillmentMode;
 import com.example.robotdelivery.robot.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -72,11 +73,14 @@ public class DeliveryService {
         this.properties = properties;
     }
 
-    /** 分配机器人与载物仓（冷藏订单优先冷藏仓） */
+    /** 分配机器人与载物仓（冷藏订单优先冷藏仓）；人工配送单无需机器人 */
     @Transactional
     public DeliveryOrder assignRobot(Long orderId, Long robotId) {
         DeliveryOrder order = mustGet(orderId);
         requireStatus(order, DeliveryStatus.CREATED);
+        if (order.getFulfillmentMode() == FulfillmentMode.MANUAL_DELIVERY) {
+            throw ApiException.conflict("订单履约方式为人工配送（夜间限行降级），无需分配机器人，请直接人工接力");
+        }
         Robot robot = robotRepository.findById(robotId)
                 .orElseThrow(() -> ApiException.notFound("机器人不存在: " + robotId));
         if (!robot.getCommunity().getId().equals(order.getCommunity().getId())) {
@@ -143,19 +147,26 @@ public class DeliveryService {
         return order;
     }
 
-    /** 到达用户门口：短信 + 小程序通知用户取件 */
+    /** 到达用户门口：短信 + 小程序通知用户取件；门岗自提单由机器人送至小区门岗后通知 */
     @Transactional
     public DeliveryOrder arriveDoor(Long orderId) {
         DeliveryOrder order = mustGet(orderId);
-        if (order.getStatus() != DeliveryStatus.ENTERING && order.getStatus() != DeliveryStatus.ON_FLOOR) {
+        boolean gatePickupArrived = order.getFulfillmentMode() == FulfillmentMode.GATE_PICKUP
+                && order.getStatus() == DeliveryStatus.ASSIGNED;
+        if (!gatePickupArrived && order.getStatus() != DeliveryStatus.ENTERING
+                && order.getStatus() != DeliveryStatus.ON_FLOOR) {
             throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许上报到门（需先进入楼栋/到达楼层）");
         }
         order.setStatus(DeliveryStatus.WAITING_PICKUP);
         order.setNotifiedAt(LocalDateTime.now());
         orderRepository.save(order);
 
+        Map<String, Object> arrivedPayload = basePayload(order);
+        if (gatePickupArrived) {
+            arrivedPayload.put("handoffPoint", "小区门岗（夜间限行门岗自提）");
+        }
         eventService.emit(order.getId(), order.getCommunity().getId(),
-                EventType.ARRIVED_AT_DOOR, EventActor.ROBOT, basePayload(order));
+                EventType.ARRIVED_AT_DOOR, EventActor.ROBOT, arrivedPayload);
         notificationService.notifyArrival(order);
 
         Map<String, Object> payload = basePayload(order);
@@ -253,15 +264,17 @@ public class DeliveryService {
         return order;
     }
 
-    /** 人工接力：机器人无法继续配送时交由人工配送员完成 */
+    /** 人工接力：机器人无法继续配送时交由人工配送员完成；夜间限行人工配送单直接由人工承接 */
     @Transactional
     public DeliveryOrder manualRelay(Long orderId, String courierName) {
         DeliveryOrder order = mustGet(orderId);
-        if (!RELAY_ALLOWED.contains(order.getStatus())) {
+        boolean manualDeliveryTakeover = order.getFulfillmentMode() == FulfillmentMode.MANUAL_DELIVERY
+                && (order.getStatus() == DeliveryStatus.CREATED || order.getStatus() == DeliveryStatus.ASSIGNED);
+        if (!manualDeliveryTakeover && !RELAY_ALLOWED.contains(order.getStatus())) {
             throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许人工接力");
         }
         order.setRelayCourier(courierName);
-        if (order.getStatus() == DeliveryStatus.EXCEPTION) {
+        if (order.getStatus() == DeliveryStatus.EXCEPTION || manualDeliveryTakeover) {
             order.setStatus(DeliveryStatus.ENTERING);
         }
         orderRepository.save(order);
@@ -269,6 +282,9 @@ public class DeliveryService {
 
         Map<String, Object> payload = basePayload(order);
         payload.put("courier", courierName);
+        if (manualDeliveryTakeover) {
+            payload.put("detail", "夜间限行人工配送单，配送员直接承接");
+        }
         eventService.emit(order.getId(), order.getCommunity().getId(),
                 EventType.MANUAL_RELAY, EventActor.OPS, payload);
         return order;

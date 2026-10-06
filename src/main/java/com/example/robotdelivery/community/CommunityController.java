@@ -6,6 +6,7 @@ import com.example.robotdelivery.config.ApiException;
 import com.example.robotdelivery.event.DeliveryEventService;
 import com.example.robotdelivery.event.EventActor;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightCurfewService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -27,13 +28,16 @@ public class CommunityController {
     private final CommunityRepository communityRepository;
     private final BuildingRepository buildingRepository;
     private final DeliveryEventService eventService;
+    private final NightCurfewService nightCurfewService;
 
     public CommunityController(CommunityRepository communityRepository,
                                BuildingRepository buildingRepository,
-                               DeliveryEventService eventService) {
+                               DeliveryEventService eventService,
+                               NightCurfewService nightCurfewService) {
         this.communityRepository = communityRepository;
         this.buildingRepository = buildingRepository;
         this.eventService = eventService;
+        this.nightCurfewService = nightCurfewService;
     }
 
     @Operation(summary = "社区列表")
@@ -54,7 +58,8 @@ public class CommunityController {
             @NotBlank @Pattern(regexp = "^\\d{2}:\\d{2}$", message = "格式须为 HH:mm") String nightEnd) {
     }
 
-    @Operation(summary = "物业设置夜间运行限制规则")
+    @Operation(summary = "物业设置夜间运行限制规则",
+            description = "变更后立即影响该小区后续接单策略；若当前已处于限行时段，在楼机器人被要求尽快完成并退出")
     @RequireRole({Role.PROPERTY, Role.ADMIN})
     @PutMapping("/{id}/night-rule")
     @Transactional
@@ -66,11 +71,15 @@ public class CommunityController {
         community.setNightEnd(request.nightEnd());
         communityRepository.save(community);
 
+        // 规则变更即时生效：若当前已处于限行时段，立即要求在楼机器人尽快完成并退出
+        int evacuationMarked = nightCurfewService.markEvacuationForCommunity(community);
+
         Map<String, Object> payload = new HashMap<>();
         payload.put("communityName", community.getName());
         payload.put("nightRestricted", community.isNightRestricted());
         payload.put("nightStart", community.getNightStart());
         payload.put("nightEnd", community.getNightEnd());
+        payload.put("evacuationMarked", evacuationMarked);
         eventService.emit(null, community.getId(), EventType.RULE_UPDATED, EventActor.PROPERTY, payload);
         return community;
     }

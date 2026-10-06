@@ -8,9 +8,13 @@ import com.example.robotdelivery.cs.Responsibility;
 import com.example.robotdelivery.event.DeliveryEventService;
 import com.example.robotdelivery.event.EventActor;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightCurfewService;
+import com.example.robotdelivery.night.NightExemption;
+import com.example.robotdelivery.night.NightWindow;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
+import com.example.robotdelivery.order.FulfillmentMode;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,10 +22,12 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * 物业门禁协同：机器人到小区门口申请门禁，物业开通或拒绝；
- * 物业要求限制夜间运行时，夜间时段的申请自动拒绝。
+ * 物业要求限制夜间运行时，夜间时段的申请自动拒绝（命中有效临时放行的订单除外）；
+ * 夜间限行降级单（门岗自提/人工配送）机器人不进楼，不能申请门禁。
  */
 @Service
 public class AccessService {
@@ -30,15 +36,18 @@ public class AccessService {
     private final DeliveryOrderRepository orderRepository;
     private final DeliveryEventService eventService;
     private final CsService csService;
+    private final NightCurfewService nightCurfewService;
 
     public AccessService(AccessRequestRepository accessRepository,
                          DeliveryOrderRepository orderRepository,
                          DeliveryEventService eventService,
-                         CsService csService) {
+                         CsService csService,
+                         NightCurfewService nightCurfewService) {
         this.accessRepository = accessRepository;
         this.orderRepository = orderRepository;
         this.eventService = eventService;
         this.csService = csService;
+        this.nightCurfewService = nightCurfewService;
     }
 
     @Transactional
@@ -47,7 +56,15 @@ public class AccessService {
         if (order.getStatus() != DeliveryStatus.ASSIGNED) {
             throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许申请门禁（需先分配机器人）");
         }
+        if (order.getFulfillmentMode() != FulfillmentMode.ROBOT) {
+            throw ApiException.conflict("订单履约方式为[" + order.getFulfillmentMode()
+                    + "]（夜间限行降级），机器人无需进楼，不能申请门禁");
+        }
         Community community = order.getCommunity();
+
+        // 夜间临时放行（如药品单，按有效期+适用楼栋）：夜间时段不自动拒绝
+        Optional<NightExemption> exemption = nightCurfewService.findActiveExemption(
+                community.getId(), order.getBuilding().getId(), order.getOrderType(), LocalDateTime.now());
 
         AccessRequest request = new AccessRequest();
         request.setDelivery(order);
@@ -60,11 +77,12 @@ public class AccessService {
         orderRepository.save(order);
 
         Map<String, Object> payload = basePayload(order, request);
+        exemption.ifPresent(e -> payload.put("nightExemptionId", e.getId()));
         eventService.emit(order.getId(), community.getId(),
                 EventType.ACCESS_REQUESTED, EventActor.ROBOT, payload);
 
-        // 物业夜间限制运行：夜间时段自动拒绝
-        if (community.isNightRestricted() && isNightNow(community)) {
+        // 物业夜间限制运行：夜间时段自动拒绝（命中临时放行的订单除外）
+        if (community.isNightRestricted() && isNightNow(community) && exemption.isEmpty()) {
             String reason = "物业夜间限制运行时段 " + community.getNightStart() + "-" + community.getNightEnd();
             request.setStatus(AccessStatus.DENIED);
             request.setReason(reason);
@@ -135,16 +153,7 @@ public class AccessService {
 
     /** 判断是否处于夜间限制时段（支持跨零点，如 22:00-07:00） */
     public boolean isNightNow(Community community) {
-        LocalTime now = LocalTime.now();
-        LocalTime start = LocalTime.parse(community.getNightStart());
-        LocalTime end = LocalTime.parse(community.getNightEnd());
-        if (start.equals(end)) {
-            return true;
-        }
-        if (start.isBefore(end)) {
-            return !now.isBefore(start) && now.isBefore(end);
-        }
-        return !now.isBefore(start) || now.isBefore(end);
+        return NightWindow.contains(community.getNightStart(), community.getNightEnd(), LocalTime.now());
     }
 
     private Map<String, Object> basePayload(DeliveryOrder order, AccessRequest request) {

@@ -48,6 +48,15 @@ public class DeliveryOrder {
     @Column(name = "estimated_delivery_at")
     private LocalDateTime estimatedDeliveryAt;
 
+    /** 履约方式：机器人进楼 / 门岗自提 / 人工配送（夜间限行降级） */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "fulfillment_mode", nullable = false, length = 20)
+    private FulfillmentMode fulfillmentMode = FulfillmentMode.ROBOT;
+
+    /** 命中的夜间临时放行 id（不受限行约束的药品单等） */
+    @Column(name = "night_exemption_id")
+    private Long nightExemptionId;
+
     @Column(name = "user_name", nullable = false, length = 64)
     private String userName;
 
@@ -95,6 +104,18 @@ public class DeliveryOrder {
 
     @Column(name = "pickup_timed_out", nullable = false)
     private boolean pickupTimedOut;
+
+    /** 夜间限行：系统已要求在楼机器人尽快完成并退出 */
+    @Column(name = "night_exit_required", nullable = false)
+    private boolean nightExitRequired;
+
+    /** 要求退出楼栋的截止时间 */
+    @Column(name = "night_exit_deadline")
+    private LocalDateTime nightExitDeadline;
+
+    /** 机器人实际退出楼栋时间 */
+    @Column(name = "exited_building_at")
+    private LocalDateTime exitedBuildingAt;
 
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;

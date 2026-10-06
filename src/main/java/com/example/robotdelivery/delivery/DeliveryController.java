@@ -8,6 +8,7 @@ import com.example.robotdelivery.elevator.ElevatorRequest;
 import com.example.robotdelivery.elevator.ElevatorService;
 import com.example.robotdelivery.event.DeliveryEvent;
 import com.example.robotdelivery.event.DeliveryEventRepository;
+import com.example.robotdelivery.night.NightCurfewService;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.OrderService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -29,17 +30,20 @@ public class DeliveryController {
     private final ElevatorService elevatorService;
     private final OrderService orderService;
     private final DeliveryEventRepository eventRepository;
+    private final NightCurfewService nightCurfewService;
 
     public DeliveryController(DeliveryService deliveryService,
                               AccessService accessService,
                               ElevatorService elevatorService,
                               OrderService orderService,
-                              DeliveryEventRepository eventRepository) {
+                              DeliveryEventRepository eventRepository,
+                              NightCurfewService nightCurfewService) {
         this.deliveryService = deliveryService;
         this.accessService = accessService;
         this.elevatorService = elevatorService;
         this.orderService = orderService;
         this.eventRepository = eventRepository;
+        this.nightCurfewService = nightCurfewService;
     }
 
     @Operation(summary = "配送单详情")
@@ -175,5 +179,13 @@ public class DeliveryController {
     @PostMapping("/{id}/cancel")
     public DeliveryOrder cancel(@PathVariable Long id, @Valid @RequestBody CancelRequest request) {
         return deliveryService.cancel(id, request.reason());
+    }
+
+    @Operation(summary = "机器人退出楼栋上报",
+            description = "夜间限行要求在楼机器人尽快完成当前订单并退出；退出后物业端可见实际退出时间")
+    @RequireRole({Role.OPS, Role.ADMIN})
+    @PostMapping("/{id}/exit-building")
+    public DeliveryOrder exitBuilding(@PathVariable Long id) {
+        return nightCurfewService.exitBuilding(id);
     }
 }

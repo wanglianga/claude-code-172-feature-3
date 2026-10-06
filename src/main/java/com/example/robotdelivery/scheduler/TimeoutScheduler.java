@@ -10,6 +10,7 @@ import com.example.robotdelivery.elevator.ElevatorStatus;
 import com.example.robotdelivery.event.DeliveryEventService;
 import com.example.robotdelivery.event.EventActor;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightCurfewService;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
@@ -36,17 +37,20 @@ public class TimeoutScheduler {
     private final DeliveryEventService eventService;
     private final CsService csService;
     private final DeliveryProperties properties;
+    private final NightCurfewService nightCurfewService;
 
     public TimeoutScheduler(DeliveryOrderRepository orderRepository,
                             ElevatorRequestRepository elevatorRepository,
                             DeliveryEventService eventService,
                             CsService csService,
-                            DeliveryProperties properties) {
+                            DeliveryProperties properties,
+                            NightCurfewService nightCurfewService) {
         this.orderRepository = orderRepository;
         this.elevatorRepository = elevatorRepository;
         this.eventService = eventService;
         this.csService = csService;
         this.properties = properties;
+        this.nightCurfewService = nightCurfewService;
     }
 
     @Scheduled(fixedDelayString = "${delivery.scheduler-interval-ms:10000}",
@@ -60,6 +64,8 @@ public class TimeoutScheduler {
             checkPickupTimeout();
             checkColdChainTimeout();
             checkElevatorTimeout();
+            // 夜间限行：进入限行时段后，要求在楼机器人尽快完成当前订单并退出
+            nightCurfewService.scanAndMarkEvacuation();
         } catch (Exception e) {
             log.error("超时巡检执行失败", e);
         }

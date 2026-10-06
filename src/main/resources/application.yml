@@ -36,6 +36,7 @@ delivery:
   low-battery-threshold: ${LOW_BATTERY_THRESHOLD:20}          # 低电量阈值（%）
   scheduler-interval-ms: ${SCHEDULER_INTERVAL_MS:10000}       # 超时巡检间隔
   scheduler-enabled: ${SCHEDULER_ENABLED:true}
+  night-exit-grace-minutes: ${NIGHT_EXIT_GRACE_MINUTES:15}    # 夜间限行要求在楼机器人退出的宽限分钟数
 
 springdoc:
   swagger-ui:
