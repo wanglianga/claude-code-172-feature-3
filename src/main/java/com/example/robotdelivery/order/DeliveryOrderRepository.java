@@ -16,6 +16,8 @@ public interface DeliveryOrderRepository
     Optional<DeliveryOrder> findFirstByRobot_IdAndStatusInOrderByIdDesc(
             Long robotId, Collection<DeliveryStatus> statuses);
 
+    List<DeliveryOrder> findByStatusIn(Collection<DeliveryStatus> statuses);
+
     List<DeliveryOrder> findByStatusInAndNotifiedAtBefore(
             Collection<DeliveryStatus> statuses, LocalDateTime notifiedBefore);
 
@@ -23,4 +25,8 @@ public interface DeliveryOrderRepository
             Collection<DeliveryStatus> excludedStatuses, LocalDateTime deadlineBefore);
 
     long countByCommunityId(Long communityId);
+
+    long countByCommunityIdAndFulfillmentMode(Long communityId, FulfillmentMode mode);
+
+    long countByCommunityIdAndNightExpeditedTrue(Long communityId);
 }

@@ -96,6 +96,26 @@ public class DeliveryOrder {
     @Column(name = "pickup_timed_out", nullable = false)
     private boolean pickupTimedOut;
 
+    /** 履约方式：机器人进楼 / 门岗自提 / 人工配送（夜间限行接单前校验决定） */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "fulfillment_mode", nullable = false, length = 20)
+    private FulfillmentMode fulfillmentMode;
+
+    /** 接单前是否已按夜间限行规则完成预计到达校验（含命中放行的情况） */
+    @Column(name = "night_rechecked", nullable = false)
+    private boolean nightRechecked;
+
+    /** 限行开始时机器人已在楼内：系统催办尽快完成当前订单 */
+    @Column(name = "night_expedited", nullable = false)
+    private boolean nightExpedited;
+
+    @Column(name = "night_expedited_at")
+    private LocalDateTime nightExpeditedAt;
+
+    /** 夜间限行要求机器人撤离楼栋的截止时间 */
+    @Column(name = "exit_due_at")
+    private LocalDateTime exitDueAt;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 

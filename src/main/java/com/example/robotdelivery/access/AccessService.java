@@ -8,6 +8,8 @@ import com.example.robotdelivery.cs.Responsibility;
 import com.example.robotdelivery.event.DeliveryEventService;
 import com.example.robotdelivery.event.EventActor;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightMedicineExemption;
+import com.example.robotdelivery.night.NightPolicyService;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
@@ -30,15 +32,18 @@ public class AccessService {
     private final DeliveryOrderRepository orderRepository;
     private final DeliveryEventService eventService;
     private final CsService csService;
+    private final NightPolicyService nightPolicyService;
 
     public AccessService(AccessRequestRepository accessRepository,
                          DeliveryOrderRepository orderRepository,
                          DeliveryEventService eventService,
-                         CsService csService) {
+                         CsService csService,
+                         NightPolicyService nightPolicyService) {
         this.accessRepository = accessRepository;
         this.orderRepository = orderRepository;
         this.eventService = eventService;
         this.csService = csService;
+        this.nightPolicyService = nightPolicyService;
     }
 
     @Transactional
@@ -63,27 +68,43 @@ public class AccessService {
         eventService.emit(order.getId(), community.getId(),
                 EventType.ACCESS_REQUESTED, EventActor.ROBOT, payload);
 
-        // 物业夜间限制运行：夜间时段自动拒绝
+        // 物业夜间限制运行：夜间时段自动拒绝；命中药品临时放行（有效期+适用楼栋）的订单不拦截
         if (community.isNightRestricted() && isNightNow(community)) {
-            String reason = "物业夜间限制运行时段 " + community.getNightStart() + "-" + community.getNightEnd();
-            request.setStatus(AccessStatus.DENIED);
-            request.setReason(reason);
-            request.setDecidedAt(LocalDateTime.now());
-            request.setDecidedBy("SYSTEM");
-            accessRepository.save(request);
+            NightMedicineExemption exemption = nightPolicyService.findExemption(
+                    community, order.getOrderType(), order.getBuilding(), LocalDateTime.now());
+            if (exemption != null) {
+                Map<String, Object> exemptionPayload = nightPayload(community, request);
+                exemptionPayload.put("exemptionId", exemption.getId());
+                exemptionPayload.put("scopeBuilding", exemption.getBuilding() == null
+                        ? "全小区楼栋" : exemption.getBuilding().getName());
+                exemptionPayload.put("validFrom", exemption.getValidFrom().toString());
+                exemptionPayload.put("validTo", exemption.getValidTo().toString());
+                exemptionPayload.put("orderNo", order.getOrderNo());
+                eventService.emit(order.getId(), community.getId(),
+                        EventType.NIGHT_EXEMPTION_APPLIED, EventActor.PROPERTY,
+                        "MEDICINE_EXEMPTION", null, exemptionPayload);
+            } else {
+                String reason = "物业夜间限制运行时段 " + community.getNightStart() + "-" + community.getNightEnd()
+                        + "，机器人禁止进楼，订单改门岗自提或人工配送";
+                request.setStatus(AccessStatus.DENIED);
+                request.setReason(reason);
+                request.setDecidedAt(LocalDateTime.now());
+                request.setDecidedBy("SYSTEM");
+                accessRepository.save(request);
 
-            order.setStatus(DeliveryStatus.EXCEPTION);
-            orderRepository.save(order);
+                order.setStatus(DeliveryStatus.EXCEPTION);
+                orderRepository.save(order);
 
-            eventService.emit(order.getId(), community.getId(),
-                    EventType.NIGHT_RESTRICTED, EventActor.SYSTEM, "NIGHT_LIMIT", null,
-                    nightPayload(community, request));
-            Map<String, Object> deniedPayload = basePayload(order, request);
-            deniedPayload.put("reason", reason);
-            eventService.emit(order.getId(), community.getId(),
-                    EventType.ACCESS_DENIED, EventActor.PROPERTY, "NIGHT_LIMIT", null, deniedPayload);
-            csService.openCase(order.getId(), CaseType.NIGHT_RESTRICTED, Responsibility.PROPERTY,
-                    reason + "，机器人门口等待或改期配送", null);
+                eventService.emit(order.getId(), community.getId(),
+                        EventType.NIGHT_RESTRICTED, EventActor.SYSTEM, "NIGHT_LIMIT", null,
+                        nightPayload(community, request));
+                Map<String, Object> deniedPayload = basePayload(order, request);
+                deniedPayload.put("reason", reason);
+                eventService.emit(order.getId(), community.getId(),
+                        EventType.ACCESS_DENIED, EventActor.PROPERTY, "NIGHT_LIMIT", null, deniedPayload);
+                csService.openCase(order.getId(), CaseType.NIGHT_RESTRICTED, Responsibility.PROPERTY,
+                        reason + "，机器人门口等待或改期配送", null);
+            }
         }
         return request;
     }

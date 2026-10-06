@@ -45,6 +45,24 @@ public class NotificationService {
         return List.of(sms, mini);
     }
 
+    /**
+     * 夜间限行改门岗自提：包裹到小区门岗后通知用户凭取件码自取。
+     */
+    public List<Notification> notifyGatePickup(DeliveryOrder order, String gateName) {
+        String content = String.format(
+                "【社区配送】因物业夜间限行，您的%s订单%s已转%s%s门岗自提，请凭手机号%s到门岗取件。",
+                TYPE_CN.getOrDefault(order.getOrderType(), ""),
+                order.getOrderNo(),
+                order.getCommunity().getName(),
+                gateName == null ? "" : gateName,
+                order.getUserPhone());
+        Notification sms = save(order.getId(), NotifyChannel.SMS, order.getUserPhone(), content);
+        Notification mini = save(order.getId(), NotifyChannel.MINI_PROGRAM, order.getUserName(), content);
+        log.info("已通知用户门岗自提: deliveryId={} gate={} channels=[SMS, MINI_PROGRAM]",
+                order.getId(), gateName);
+        return List.of(sms, mini);
+    }
+
     private Notification save(Long deliveryId, NotifyChannel channel, String target, String content) {
         Notification notification = new Notification();
         notification.setDeliveryId(deliveryId);

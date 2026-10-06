@@ -28,4 +28,7 @@ public class DeliveryProperties {
 
     /** 是否开启超时巡检 */
     private boolean schedulerEnabled = true;
+
+    /** 夜间限行开始后，已在楼内机器人完成当前订单并撤离楼栋的宽限时间（秒） */
+    private long nightExitGraceSeconds = 1800;
 }

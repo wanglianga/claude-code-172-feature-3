@@ -69,11 +69,39 @@ public class DeliveryController {
     }
 
     @Operation(summary = "机器人到达小区门口，申请物业门禁",
-            description = "物业夜间限制时段将自动拒绝并触发客服介入")
+            description = "物业夜间限制时段将自动拒绝并触发客服介入；命中有效药品放行的订单不受限")
     @RequireRole({Role.OPS, Role.ADMIN})
     @PostMapping("/{id}/arrive-gate")
     public AccessRequest arriveGate(@PathVariable Long id, @Valid @RequestBody ArriveGateRequest request) {
         return accessService.requestAccess(id, request.gateName());
+    }
+
+    public record GatePickupRequest(@NotBlank String gateName) {
+    }
+
+    @Operation(summary = "门岗自提交接", description = "夜间限行改门岗自提的订单：包裹送到小区门岗并通知用户自取")
+    @RequireRole({Role.OPS, Role.PROPERTY, Role.ADMIN})
+    @PostMapping("/{id}/gate-pickup")
+    public DeliveryOrder gatePickup(@PathVariable Long id, @Valid @RequestBody GatePickupRequest request) {
+        return deliveryService.arriveAtGateForPickup(id, request.gateName());
+    }
+
+    public record ManualDispatchRequest(@NotBlank String courierName) {
+    }
+
+    @Operation(summary = "夜间人工配送派发", description = "夜间限行改人工配送的订单派发值班配送员/骑手")
+    @RequireRole({Role.OPS, Role.ADMIN})
+    @PostMapping("/{id}/manual-dispatch")
+    public DeliveryOrder manualDispatch(@PathVariable Long id,
+                                        @Valid @RequestBody ManualDispatchRequest request) {
+        return deliveryService.dispatchManualDelivery(id, request.courierName());
+    }
+
+    @Operation(summary = "人工配送员到达用户门口并通知取件")
+    @RequireRole({Role.OPS, Role.ADMIN})
+    @PostMapping("/{id}/manual-arrive-door")
+    public DeliveryOrder manualArriveDoor(@PathVariable Long id) {
+        return deliveryService.manualArriveDoor(id);
     }
 
     public record ElevatorRequestBody(@NotNull Integer fromFloor, @NotNull Integer toFloor) {

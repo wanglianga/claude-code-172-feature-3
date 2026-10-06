@@ -34,7 +34,8 @@ delivery:
   coldchain-timeout-seconds: ${COLDCHAIN_TIMEOUT_SECONDS:2700} # 冷藏订单履约时限（默认45分钟）
   elevator-timeout-seconds: ${ELEVATOR_TIMEOUT_SECONDS:180}   # 电梯请求超时（默认3分钟）
   low-battery-threshold: ${LOW_BATTERY_THRESHOLD:20}          # 低电量阈值（%）
-  scheduler-interval-ms: ${SCHEDULER_INTERVAL_MS:10000}       # 超时巡检间隔
+  night-exit-grace-seconds: ${NIGHT_EXIT_GRACE_SECONDS:1800} # 限行开始后在楼机器人完成订单并撤离的宽限时间（秒）
+  scheduler-interval-ms: ${SCHEDULER_INTERVAL_MS:10000}       # 超时/夜间撤离巡检间隔
   scheduler-enabled: ${SCHEDULER_ENABLED:true}
 
 springdoc:

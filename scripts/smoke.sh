@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟验证：主流程 + 全部异常场景 + 三端视图
+# 冒烟验证：主流程 + 全部异常场景 + 物业夜间限行增强 + 三端视图（99 项断言）
 # 用法: BASE=http://localhost:8080 ./scripts/smoke.sh
 # 依赖: curl, jq
 set -uo pipefail
@@ -201,10 +201,12 @@ req POST "/api/deliveries/$O9/request-elevator" "$OPS" '{"fromFloor":1,"toFloor"
 if wait_event "$O9" ELEVATOR_TIMEOUT 60; then ok "ELEVATOR_TIMEOUT 事件"; else bad "缺少 ELEVATOR_TIMEOUT"; fi
 req POST "/api/deliveries/$O9/cancel" "$OPS" '{"reason":"电梯长时间不可用，取消"}' >/dev/null
 
-say "10. 异常：物业夜间限制运行 -> 门禁自动拒绝"
-req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"00:00","nightEnd":"23:59"}' >/dev/null
+say "10. 异常：物业夜间限制运行 -> 机器人到门时门禁自动拒绝"
+# 机器人先在非限行时段接单出发；物业随后开启全天限行，机器人实际到门时被自动拒绝
+req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":false,"nightStart":"00:00","nightEnd":"23:59"}' >/dev/null
 O10=$(new_order 1 false FOOD)
 req POST "/api/deliveries/$O10/assign" "$OPS" '{"robotId":1}' >/dev/null
+req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"00:00","nightEnd":"23:59"}' >/dev/null
 GATE10=$(req POST "/api/deliveries/$O10/arrive-gate" "$OPS" '{"gateName":"南门"}')
 check "夜间门禁申请自动拒绝" "$(echo "$GATE10" | jq -r .status)" "DENIED"
 wait_event "$O10" NIGHT_RESTRICTED && ok "NIGHT_RESTRICTED 事件" || bad "缺少 NIGHT_RESTRICTED"
@@ -213,12 +215,121 @@ req POST "/api/deliveries/$O10/cancel" "$OPS" '{"reason":"夜间限制，改期�
 req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"22:00","nightEnd":"07:00"}' >/dev/null
 ok "已恢复社区1夜间规则(22:00-07:00 限制)"
 
+say "12. 夜间限行：接单前校验预计到达 -> 外卖改门岗自提 / 药品改人工配送（机器人不进楼）"
+req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"00:00","nightEnd":"23:59"}' >/dev/null
+O12=$(req POST /api/orders "$OPS" '{
+  "orderType":"FOOD","communityId":1,"buildingId":1,"unitNo":"2单元","roomNo":"902","coldChain":false,
+  "estimatedDeliveryAt":"2026-12-31T23:30:00","userName":"孙七","userPhone":"13800000012"}')
+check "夜间预计到达外卖单改门岗自提" "$(echo "$O12" | jq -r .fulfillmentMode)" "GATE_PICKUP"
+check "夜间接单前已完成校验标记" "$(echo "$O12" | jq -r .nightRechecked)" "true"
+wait_event "$(echo "$O12" | jq -r .id)" FULFILLMENT_DOWNGRADED && ok "FULFILLMENT_DOWNGRADED 事件" || bad "缺少降级事件"
+ASSIGN12=$(req POST "/api/deliveries/$(echo "$O12" | jq -r .id)/assign" "$OPS" '{"robotId":1}')
+check "门岗自提单分配机器人被拒(409)" "$(echo "$ASSIGN12" | jq -r .status)" "409"
+req POST "/api/deliveries/$(echo "$O12" | jq -r .id)/gate-pickup" "$OPS" '{"gateName":"南门岗亭"}' >/dev/null
+check "门岗交接后待自取" "$(req GET "/api/orders/$(echo "$O12" | jq -r .id)" "$OPS" | jq -r .status)" "WAITING_PICKUP"
+GATE_NOTIFY=$(req GET "/api/notifications?deliveryId=$(echo "$O12" | jq -r .id)" "$OPS" | jq 'length')
+check "门岗自提短信+小程序通知" "$GATE_NOTIFY" "2"
+req POST "/api/deliveries/$(echo "$O12" | jq -r .id)/sign" "$OPS" '{"signBy":"孙七"}' >/dev/null
+check "门岗自提单用户签收" "$(req GET "/api/orders/$(echo "$O12" | jq -r .id)" "$OPS" | jq -r .status)" "SIGNED"
+
+O13=$(req POST /api/orders "$OPS" '{
+  "orderType":"MEDICINE","communityId":1,"buildingId":2,"unitNo":"1单元","roomNo":"301","coldChain":true,
+  "estimatedDeliveryAt":"2026-12-31T22:15:00","userName":"周八","userPhone":"13800000013"}')
+check "夜间药品单(无放行)改人工配送" "$(echo "$O13" | jq -r .fulfillmentMode)" "MANUAL_DELIVERY"
+O13_ID=$(echo "$O13" | jq -r .id)
+req POST "/api/deliveries/$O13_ID/manual-dispatch" "$OPS" '{"courierName":"夜班骑手老李"}' >/dev/null
+req POST "/api/deliveries/$O13_ID/manual-arrive-door" "$OPS" >/dev/null
+req POST "/api/deliveries/$O13_ID/sign" "$OPS" '{"signBy":"周八"}' >/dev/null
+check "人工配送签收" "$(req GET "/api/orders/$O13_ID" "$OPS" | jq -r .status)" "SIGNED"
+wait_event "$O13_ID" MANUAL_DISPATCHED && ok "MANUAL_DISPATCHED 事件" || bad "缺少 MANUAL_DISPATCHED"
+
+say "13. 夜间限行：物业临时放行药品（有效期+适用楼栋）-> 机器人可进楼"
+EXEMPT=$(req POST /api/night/exemptions "$PROPERTY" '{
+  "communityId":1,"orderType":"MEDICINE","buildingId":1,
+  "validFrom":"2026-01-01T00:00:00","validTo":"2026-12-31T23:59:59","reason":"1栋老年慢性病急用药品临时放行"}')
+EX_ID=$(echo "$EXEMPT" | jq -r .id)
+[ -n "$EX_ID" ] && [ "$EX_ID" != "null" ] && ok "药品放行已创建#$EX_ID(有效期+适用1栋)" || bad "药品放行创建失败"
+O14=$(req POST /api/orders "$OPS" '{
+  "orderType":"MEDICINE","communityId":1,"buildingId":1,"unitNo":"3单元","roomNo":"501","coldChain":false,
+  "estimatedDeliveryAt":"2026-12-31T22:40:00","userName":"吴九","userPhone":"13800000014"}')
+O14_ID=$(echo "$O14" | jq -r .id)
+check "放行楼栋药品单仍走机器人" "$(echo "$O14" | jq -r .fulfillmentMode)" "ROBOT"
+wait_event "$O14_ID" NIGHT_EXEMPTION_APPLIED && ok "接单命中放行 NIGHT_EXEMPTION_APPLIED" || bad "缺少放行命中事件"
+req POST "/api/deliveries/$O14_ID/assign" "$OPS" '{"robotId":1}' >/dev/null
+GATE14=$(req POST "/api/deliveries/$O14_ID/arrive-gate" "$OPS" '{"gateName":"南门"}')
+check "放行药品夜间门禁不自动拒绝" "$(echo "$GATE14" | jq -r .status)" "PENDING"
+req POST "/api/access-requests/$(echo "$GATE14" | jq -r .id)/approve" "$PROPERTY" >/dev/null
+req POST "/api/deliveries/$O14_ID/arrive-door" "$OPS" >/dev/null
+req POST "/api/deliveries/$O14_ID/open-compartment" "$OPS" >/dev/null
+req POST "/api/deliveries/$O14_ID/sign" "$OPS" '{"signBy":"吴九"}' >/dev/null
+check "放行药品单签收" "$(req GET "/api/orders/$O14_ID" "$OPS" | jq -r .status)" "SIGNED"
+
+# 非适用楼栋(2栋)药品单不享受该放行 -> 仍改人工配送
+O15=$(req POST /api/orders "$OPS" '{
+  "orderType":"MEDICINE","communityId":1,"buildingId":2,"unitNo":"1单元","roomNo":"101","coldChain":false,
+  "estimatedDeliveryAt":"2026-12-31T22:45:00","userName":"郑十","userPhone":"13800000015"}')
+check "非适用楼栋药品单不享放行->人工配送" "$(echo "$O15" | jq -r .fulfillmentMode)" "MANUAL_DELIVERY"
+O15_ID=$(echo "$O15" | jq -r .id)
+# 有效期外的预计到达也不享受放行
+O16=$(req POST /api/orders "$OPS" '{
+  "orderType":"MEDICINE","communityId":1,"buildingId":1,"unitNo":"3单元","roomNo":"502","coldChain":false,
+  "estimatedDeliveryAt":"2027-01-02T22:40:00","userName":"王十一","userPhone":"13800000016"}')
+check "放行有效期外预计到达不豁免" "$(echo "$O16" | jq -r .fulfillmentMode)" "MANUAL_DELIVERY"
+O16_ID=$(echo "$O16" | jq -r .id)
+check "当前有效放行可按小区检索" "$(req GET '/api/night/exemptions?communityId=1&activeOnly=true' "$PROPERTY" | jq 'length')" "1"
+# 停用放行不影响查询结论（停用后 activeOnly=0）
+req PUT "/api/night/exemptions/$EX_ID" "$PROPERTY" '{"enabled":false}' >/dev/null
+check "停用后当前有效放行数为0" "$(req GET '/api/night/exemptions?communityId=1&activeOnly=true' "$PROPERTY" | jq 'length')" "0"
+req POST "/api/deliveries/$O15_ID/cancel" "$OPS" '{"reason":"夜间改期"}' >/dev/null
+req POST "/api/deliveries/$O16_ID/cancel" "$OPS" '{"reason":"夜间改期"}' >/dev/null
+
+say "14. 夜间限行：机器人已在楼内 -> 催办尽快完成并撤离，物业端可查结束时间与路线"
+# 恢复 22:00-07:00，先在非限行时段把机器人送进楼，再把规则临时改为全天限行模拟限行开始
+req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":false,"nightStart":"22:00","nightEnd":"07:00"}' >/dev/null
+O17=$(new_order 1 false GROCERY)
+req POST "/api/deliveries/$O17/assign" "$OPS" '{"robotId":1}' >/dev/null
+AR17=$(req POST "/api/deliveries/$O17/arrive-gate" "$OPS" '{"gateName":"南门"}' | jq -r .id)
+req POST "/api/access-requests/$AR17/approve" "$PROPERTY" >/dev/null
+req POST "/api/deliveries/$O17/arrive-door" "$OPS" >/dev/null
+# 限行开始（规则变更立即影响在楼机器人）
+RULE17=$(req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"00:00","nightEnd":"23:59"}')
+check "规则变更后立即催办在楼机器人" "$(echo "$RULE17" | jq -r .newExitPlans)" "1"
+wait_event "$O17" NIGHT_ORDER_EXPEDITED && ok "NIGHT_ORDER_EXPEDITED 催办事件" || bad "缺少催办事件"
+wait_event "$O17" NIGHT_EXIT_PLANNED && ok "NIGHT_EXIT_PLANNED 撤离计划事件" || bad "缺少撤离计划事件"
+check "订单被标记夜间催办" "$(req GET "/api/orders/$O17" "$OPS" | jq -r .nightExpedited)" "true"
+PLAN=$(req GET "/api/night/exit-plans?communityId=1&status=NOTIFIED" "$PROPERTY")
+PLAN_ID=$(echo "$PLAN" | jq -r ".[] | select(.deliveryId==$O17) | .id")
+[ -n "$PLAN_ID" ] && [ "$PLAN_ID" != "null" ] && ok "物业端查到撤离计划#$PLAN_ID" || bad "物业端未查到撤离计划"
+echo "  撤离计划: $(echo "$PLAN" | jq -c ".[] | select(.deliveryId==$O17) | {expectedExitAt, exitRoute, status}")"
+echo "$PLAN" | jq -e ".[] | select(.deliveryId==$O17) | select(.exitRoute | contains(\"门岗\"))" >/dev/null \
+  && ok "撤离路线含门岗/楼外等待区" || bad "撤离路线缺少门岗"
+echo "$PLAN" | jq -e ".[] | select(.deliveryId==$O17) | (.expectedExitAt != null)" >/dev/null \
+  && ok "撤离计划含预计结束时间" || bad "撤离计划缺少结束时间"
+# 完成当前订单并确认撤离
+req POST "/api/deliveries/$O17/open-compartment" "$OPS" >/dev/null
+req POST "/api/deliveries/$O17/sign" "$OPS" '{"signBy":"钱十二"}' >/dev/null
+req POST "/api/night/exit-plans/$PLAN_ID/confirm-exit" "$PROPERTY" >/dev/null
+wait_event "$O17" NIGHT_EXITED && ok "NIGHT_EXITED 撤离事件" || bad "缺少撤离事件"
+PLAN_DONE=$(req GET "/api/night/exit-plans?communityId=1&status=EXITED" "$PROPERTY")
+echo "$PLAN_DONE" | jq -e ".[] | select(.id==$PLAN_ID) | select(.exitedAt != null and .finishedOrderAt != null)" >/dev/null \
+  && ok "物业端可见订单完成时间与实际撤离时间" || bad "撤离完成时间未登记"
+req PUT /api/communities/1/night-rule "$PROPERTY" '{"nightRestricted":true,"nightStart":"22:00","nightEnd":"07:00"}' >/dev/null
+ok "已恢复社区1夜间规则(22:00-07:00)"
+
 say "11. 三端视图"
 IMPACT=$(req GET "/api/analytics/property/passage-impact?communityId=1" "$PROPERTY")
 check "物业端-避障停留次数>=2" "$(echo "$IMPACT" | jq '.obstacleStopCount >= 2')" "true"
 check "物业端-施工绕行>=1" "$(echo "$IMPACT" | jq '.constructionDetours >= 1')" "true"
 check "物业端-电梯满载>=1" "$(echo "$IMPACT" | jq '.elevatorFullCount >= 1')" "true"
 check "物业端-夜间限制>=1" "$(echo "$IMPACT" | jq '.nightRestrictedCount >= 1')" "true"
+check "物业端-夜间接单降级>=3" "$(echo "$IMPACT" | jq '.nightDowngradedCount >= 3')" "true"
+check "物业端-门岗自提单>=1" "$(echo "$IMPACT" | jq '.gatePickupOrders >= 1')" "true"
+check "物业端-人工配送单>=2" "$(echo "$IMPACT" | jq '.manualDeliveryOrders >= 2')" "true"
+check "物业端-药品放行命中>=1" "$(echo "$IMPACT" | jq '.nightExemptionAppliedCount >= 1')" "true"
+check "物业端-夜间催办在楼机器人>=1" "$(echo "$IMPACT" | jq '.nightExpeditedOrders >= 1')" "true"
+check "物业端-撤离计划>=1" "$(echo "$IMPACT" | jq '.nightExitPlannedCount >= 1')" "true"
+check "物业端-已撤离>=1" "$(echo "$IMPACT" | jq '.nightExitDoneCount >= 1')" "true"
+check "物业端-停用后当前有效放行=0" "$(echo "$IMPACT" | jq '.activeMedicineExemptions')" "0"
 check "物业端-投诉数>=1" "$(echo "$IMPACT" | jq '.complaintCount >= 1')" "true"
 echo "  物业端通行影响: $(echo "$IMPACT" | jq -c '{impactLevel,affectsResidents,suggestion}')"
 EFF=$(req GET "/api/analytics/ops/efficiency?communityId=1" "$OPS")

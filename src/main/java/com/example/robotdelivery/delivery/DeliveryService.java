@@ -10,10 +10,14 @@ import com.example.robotdelivery.cs.Responsibility;
 import com.example.robotdelivery.event.DeliveryEventService;
 import com.example.robotdelivery.event.EventActor;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightExitService;
+import com.example.robotdelivery.night.NightPolicyService;
 import com.example.robotdelivery.notification.NotificationService;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
+import com.example.robotdelivery.order.FulfillmentMode;
+import com.example.robotdelivery.order.OrderService;
 import com.example.robotdelivery.robot.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -53,6 +57,9 @@ public class DeliveryService {
     private final NotificationService notificationService;
     private final CsService csService;
     private final DeliveryProperties properties;
+    private final NightPolicyService nightPolicyService;
+    private final NightExitService nightExitService;
+    private final OrderService orderService;
 
     public DeliveryService(DeliveryOrderRepository orderRepository,
                            RobotRepository robotRepository,
@@ -61,7 +68,10 @@ public class DeliveryService {
                            DeliveryEventService eventService,
                            NotificationService notificationService,
                            CsService csService,
-                           DeliveryProperties properties) {
+                           DeliveryProperties properties,
+                           NightPolicyService nightPolicyService,
+                           NightExitService nightExitService,
+                           OrderService orderService) {
         this.orderRepository = orderRepository;
         this.robotRepository = robotRepository;
         this.compartmentRepository = compartmentRepository;
@@ -70,6 +80,9 @@ public class DeliveryService {
         this.notificationService = notificationService;
         this.csService = csService;
         this.properties = properties;
+        this.nightPolicyService = nightPolicyService;
+        this.nightExitService = nightExitService;
+        this.orderService = orderService;
     }
 
     /** 分配机器人与载物仓（冷藏订单优先冷藏仓） */
@@ -77,6 +90,33 @@ public class DeliveryService {
     public DeliveryOrder assignRobot(Long orderId, Long robotId) {
         DeliveryOrder order = mustGet(orderId);
         requireStatus(order, DeliveryStatus.CREATED);
+
+        // 接单策略：夜间限行订单已降级为门岗自提/人工配送，不分配机器人进楼
+        if (order.getFulfillmentMode() != FulfillmentMode.ROBOT) {
+            throw ApiException.conflict("该订单已按物业夜间限行规则改为"
+                    + modeCn(order.getFulfillmentMode())
+                    + "，机器人不进楼；请走门岗交接或人工配送流程");
+        }
+        // 规则可能在下单后收紧：分配前按当前夜间限行规则与预计到达时间再校验一次
+        NightPolicyService.PreAcceptResult recheck = nightPolicyService.evaluateOnAccept(
+                order.getOrderType(), order.getCommunity(), order.getBuilding(),
+                order.getEstimatedDeliveryAt());
+        if (recheck.nightBlocked()) {
+            order.setFulfillmentMode(recheck.mode());
+            orderRepository.save(order);
+
+            Map<String, Object> payload = basePayload(order);
+            payload.put("nightStart", order.getCommunity().getNightStart());
+            payload.put("nightEnd", order.getCommunity().getNightEnd());
+            payload.put("fulfillmentMode", recheck.mode().name());
+            payload.put("reason", recheck.reason());
+            payload.put("detail", "夜间限行规则在下单后收紧，分配机器人时复检命中");
+            eventService.emit(order.getId(), order.getCommunity().getId(),
+                    EventType.FULFILLMENT_DOWNGRADED, EventActor.SYSTEM, "NIGHT_LIMIT", null, payload);
+            throw ApiException.conflict("夜间限行规则已变更，该订单改为"
+                    + modeCn(recheck.mode()) + "，机器人不可接单进楼");
+        }
+
         Robot robot = robotRepository.findById(robotId)
                 .orElseThrow(() -> ApiException.notFound("机器人不存在: " + robotId));
         if (!robot.getCommunity().getId().equals(order.getCommunity().getId())) {
@@ -143,10 +183,13 @@ public class DeliveryService {
         return order;
     }
 
-    /** 到达用户门口：短信 + 小程序通知用户取件 */
+    /** 到达用户门口：短信 + 小程序通知用户取件（机器人单；人工配送请走 manual-arrive-door） */
     @Transactional
     public DeliveryOrder arriveDoor(Long orderId) {
         DeliveryOrder order = mustGet(orderId);
+        if (order.getFulfillmentMode() != FulfillmentMode.ROBOT) {
+            throw ApiException.badRequest("门岗自提/人工配送订单请走对应履约流程");
+        }
         if (order.getStatus() != DeliveryStatus.ENTERING && order.getStatus() != DeliveryStatus.ON_FLOOR) {
             throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许上报到门（需先进入楼栋/到达楼层）");
         }
@@ -170,6 +213,9 @@ public class DeliveryService {
     @Transactional
     public DeliveryOrder openCompartment(Long orderId) {
         DeliveryOrder order = mustGet(orderId);
+        if (order.getFulfillmentMode() != FulfillmentMode.ROBOT) {
+            throw ApiException.badRequest("门岗自提/人工配送订单无载物仓开仓环节");
+        }
         requireStatus(order, DeliveryStatus.WAITING_PICKUP);
         order.setStatus(DeliveryStatus.COMPARTMENT_OPEN);
         orderRepository.save(order);
@@ -196,15 +242,100 @@ public class DeliveryService {
         return order;
     }
 
+    /** 门岗自提：机器人不进楼，包裹送至小区门岗，通知用户凭手机号自取 */
+    @Transactional
+    public DeliveryOrder arriveAtGateForPickup(Long orderId, String gateName) {
+        DeliveryOrder order = mustGet(orderId);
+        if (order.getFulfillmentMode() != FulfillmentMode.GATE_PICKUP) {
+            throw ApiException.badRequest("该订单履约方式不是门岗自提: " + order.getFulfillmentMode());
+        }
+        if (order.getStatus() != DeliveryStatus.CREATED) {
+            throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许门岗交接");
+        }
+        order.setStatus(DeliveryStatus.WAITING_PICKUP);
+        order.setNotifiedAt(LocalDateTime.now());
+        orderRepository.save(order);
+
+        Map<String, Object> payload = basePayload(order);
+        payload.put("gateName", gateName);
+        eventService.emit(order.getId(), order.getCommunity().getId(),
+                EventType.ARRIVED_AT_GATE, EventActor.ROBOT, payload);
+        notificationService.notifyGatePickup(order, gateName);
+
+        Map<String, Object> notified = basePayload(order);
+        notified.put("channels", "SMS,MINI_PROGRAM");
+        notified.put("pickupPoint", "GATE:" + gateName);
+        notified.put("userPhone", order.getUserPhone());
+        eventService.emit(order.getId(), order.getCommunity().getId(),
+                EventType.USER_NOTIFIED, EventActor.SYSTEM, "GATE_PICKUP", null, notified);
+        return order;
+    }
+
+    /** 人工配送：夜间限行订单派发值班配送员/骑手配送上门 */
+    @Transactional
+    public DeliveryOrder dispatchManualDelivery(Long orderId, String courierName) {
+        DeliveryOrder order = mustGet(orderId);
+        if (order.getFulfillmentMode() != FulfillmentMode.MANUAL_DELIVERY) {
+            throw ApiException.badRequest("该订单履约方式不是人工配送: " + order.getFulfillmentMode());
+        }
+        if (order.getStatus() != DeliveryStatus.CREATED) {
+            throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许派发人工配送");
+        }
+        order.setRelayCourier(courierName);
+        order.setStatus(DeliveryStatus.ENTERING);
+        orderRepository.save(order);
+
+        Map<String, Object> payload = basePayload(order);
+        payload.put("courier", courierName);
+        eventService.emit(order.getId(), order.getCommunity().getId(),
+                EventType.MANUAL_DISPATCHED, EventActor.OPS, "NIGHT_LIMIT", null, payload);
+        return order;
+    }
+
+    /** 人工配送员到达用户门口并通知取件 */
+    @Transactional
+    public DeliveryOrder manualArriveDoor(Long orderId) {
+        DeliveryOrder order = mustGet(orderId);
+        if (order.getFulfillmentMode() != FulfillmentMode.MANUAL_DELIVERY) {
+            throw ApiException.badRequest("该订单履约方式不是人工配送: " + order.getFulfillmentMode());
+        }
+        if (order.getStatus() != DeliveryStatus.ENTERING) {
+            throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许人工配送到门");
+        }
+        order.setStatus(DeliveryStatus.WAITING_PICKUP);
+        order.setNotifiedAt(LocalDateTime.now());
+        orderRepository.save(order);
+
+        Map<String, Object> payload = basePayload(order);
+        payload.put("courier", order.getRelayCourier());
+        eventService.emit(order.getId(), order.getCommunity().getId(),
+                EventType.ARRIVED_AT_DOOR, EventActor.OPS, "MANUAL_DELIVERY", null, payload);
+        notificationService.notifyArrival(order);
+
+        Map<String, Object> notified = basePayload(order);
+        notified.put("channels", "SMS,MINI_PROGRAM");
+        notified.put("userPhone", order.getUserPhone());
+        eventService.emit(order.getId(), order.getCommunity().getId(),
+                EventType.USER_NOTIFIED, EventActor.SYSTEM, "MANUAL_DELIVERY", null, notified);
+        return order;
+    }
+
     /** 用户签收 */
     @Transactional
     public DeliveryOrder sign(Long orderId, String signBy) {
         DeliveryOrder order = mustGet(orderId);
-        requireStatus(order, DeliveryStatus.COMPARTMENT_OPEN);
+        // 门岗自提/人工配送无载物仓开仓环节，到门待取即可签收；机器人单必须先开仓
+        boolean nonRobotReady = order.getFulfillmentMode() != FulfillmentMode.ROBOT
+                && order.getStatus() == DeliveryStatus.WAITING_PICKUP;
+        if (order.getStatus() != DeliveryStatus.COMPARTMENT_OPEN && !nonRobotReady) {
+            throw ApiException.conflict(
+                    "当前状态[" + order.getStatus() + "]不允许签收（机器人单需先打开载物仓）");
+        }
         order.setStatus(DeliveryStatus.SIGNED);
         order.setSignedAt(LocalDateTime.now());
         orderRepository.save(order);
         releaseRobotAndCompartment(order);
+        nightExitService.noteOrderFinished(order.getId());
 
         Map<String, Object> payload = basePayload(order);
         payload.put("signBy", signBy);
@@ -244,6 +375,7 @@ public class DeliveryService {
         order.setReturnedAt(LocalDateTime.now());
         orderRepository.save(order);
         releaseRobotAndCompartment(order);
+        nightExitService.noteOrderFinished(order.getId());
 
         Map<String, Object> payload = basePayload(order);
         payload.put("reason", order.getReturnReason());
@@ -309,6 +441,7 @@ public class DeliveryService {
         order.setStatus(DeliveryStatus.CANCELLED);
         orderRepository.save(order);
         releaseRobotAndCompartment(order);
+        nightExitService.noteOrderFinished(order.getId());
 
         Map<String, Object> payload = basePayload(order);
         payload.put("reason", reason);
@@ -356,6 +489,14 @@ public class DeliveryService {
         if (order.getStatus() != expected) {
             throw ApiException.conflict("当前状态[" + order.getStatus() + "]不允许该操作（需要状态: " + expected + "）");
         }
+    }
+
+    static String modeCn(FulfillmentMode mode) {
+        return switch (mode) {
+            case ROBOT -> "机器人进楼配送";
+            case GATE_PICKUP -> "门岗自提";
+            case MANUAL_DELIVERY -> "人工配送";
+        };
     }
 
     private DeliveryOrder mustGet(Long orderId) {

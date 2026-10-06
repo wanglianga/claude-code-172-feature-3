@@ -4,9 +4,13 @@ import com.example.robotdelivery.complaint.ComplaintRepository;
 import com.example.robotdelivery.event.DeliveryEvent;
 import com.example.robotdelivery.event.DeliveryEventRepository;
 import com.example.robotdelivery.event.EventType;
+import com.example.robotdelivery.night.NightExitPlanRepository;
+import com.example.robotdelivery.night.NightExitPlanStatus;
+import com.example.robotdelivery.night.NightMedicineExemptionRepository;
 import com.example.robotdelivery.order.DeliveryOrder;
 import com.example.robotdelivery.order.DeliveryOrderRepository;
 import com.example.robotdelivery.order.DeliveryStatus;
+import com.example.robotdelivery.order.FulfillmentMode;
 import com.example.robotdelivery.order.OrderType;
 import jakarta.persistence.criteria.Predicate;
 import org.springframework.data.jpa.domain.Specification;
@@ -25,13 +29,19 @@ public class AnalyticsService {
     private final DeliveryEventRepository eventRepository;
     private final DeliveryOrderRepository orderRepository;
     private final ComplaintRepository complaintRepository;
+    private final NightExitPlanRepository exitPlanRepository;
+    private final NightMedicineExemptionRepository exemptionRepository;
 
     public AnalyticsService(DeliveryEventRepository eventRepository,
                             DeliveryOrderRepository orderRepository,
-                            ComplaintRepository complaintRepository) {
+                            ComplaintRepository complaintRepository,
+                            NightExitPlanRepository exitPlanRepository,
+                            NightMedicineExemptionRepository exemptionRepository) {
         this.eventRepository = eventRepository;
         this.orderRepository = orderRepository;
         this.complaintRepository = complaintRepository;
+        this.exitPlanRepository = exitPlanRepository;
+        this.exemptionRepository = exemptionRepository;
     }
 
     /**
@@ -63,6 +73,25 @@ public class AnalyticsService {
         long complaints = complaintRepository.countByDelivery_Community_Id(communityId);
         long deliveries = orderRepository.countByCommunityId(communityId);
 
+        // 夜间限行相关：接单降级、放行、催办撤离
+        long downgraded = eventRepository.countByCommunityIdAndEventType(
+                communityId, EventType.FULFILLMENT_DOWNGRADED.name());
+        long gatePickupOrders = orderRepository.countByCommunityIdAndFulfillmentMode(
+                communityId, FulfillmentMode.GATE_PICKUP);
+        long manualDeliveryOrders = orderRepository.countByCommunityIdAndFulfillmentMode(
+                communityId, FulfillmentMode.MANUAL_DELIVERY);
+        long exemptionApplied = eventRepository.countByCommunityIdAndEventType(
+                communityId, EventType.NIGHT_EXEMPTION_APPLIED.name());
+        long nightExpeditedOrders = orderRepository.countByCommunityIdAndNightExpeditedTrue(communityId);
+        long exitPlanned = eventRepository.countByCommunityIdAndEventType(
+                communityId, EventType.NIGHT_EXIT_PLANNED.name());
+        long exitDone = exitPlanRepository.countByCommunityIdAndStatus(
+                communityId, NightExitPlanStatus.EXITED);
+        long activeExemptions = exemptionRepository
+                .findByCommunityIdAndEnabledTrueAndValidFromLessThanEqualAndValidToGreaterThanEqual(
+                        communityId, java.time.LocalDateTime.now(), java.time.LocalDateTime.now())
+                .size();
+
         long impactScore = obstacleCount + constructionDetours * 2 + elevatorFull
                 + nightRestricted * 2 + complaints * 3;
         String impactLevel = impactScore == 0 ? "无影响" : impactScore < 5 ? "低" : impactScore < 15 ? "中" : "高";
@@ -82,6 +111,14 @@ public class AnalyticsService {
         result.put("accessDeniedCount", accessDenied);
         result.put("lowBatteryCount", lowBattery);
         result.put("complaintCount", complaints);
+        result.put("nightDowngradedCount", downgraded);
+        result.put("gatePickupOrders", gatePickupOrders);
+        result.put("manualDeliveryOrders", manualDeliveryOrders);
+        result.put("nightExemptionAppliedCount", exemptionApplied);
+        result.put("nightExpeditedOrders", nightExpeditedOrders);
+        result.put("nightExitPlannedCount", exitPlanned);
+        result.put("nightExitDoneCount", exitDone);
+        result.put("activeMedicineExemptions", activeExemptions);
         result.put("impactScore", impactScore);
         result.put("impactLevel", impactLevel);
         result.put("affectsResidents", impactScore >= 5);
@@ -130,6 +167,11 @@ public class AnalyticsService {
             long inProgress = total - signed - returned - cancelled;
             long coldChainTimeouts = list.stream().filter(DeliveryOrder::isColdChainTimedOut).count();
             long pickupTimeouts = list.stream().filter(DeliveryOrder::isPickupTimedOut).count();
+            long gatePickup = list.stream()
+                    .filter(o -> o.getFulfillmentMode() == FulfillmentMode.GATE_PICKUP).count();
+            long manualDelivery = list.stream()
+                    .filter(o -> o.getFulfillmentMode() == FulfillmentMode.MANUAL_DELIVERY).count();
+            long nightExpedited = list.stream().filter(DeliveryOrder::isNightExpedited).count();
             double avgSeconds = list.stream()
                     .filter(o -> o.getSignedAt() != null)
                     .mapToLong(o -> Duration.between(o.getCreatedAt(), o.getSignedAt()).getSeconds())
@@ -151,6 +193,9 @@ public class AnalyticsService {
             row.put("avgDeliverySeconds", Math.round(avgSeconds));
             row.put("coldChainTimeouts", coldChainTimeouts);
             row.put("pickupTimeouts", pickupTimeouts);
+            row.put("gatePickupOrders", gatePickup);
+            row.put("manualDeliveryOrders", manualDelivery);
+            row.put("nightExpeditedOrders", nightExpedited);
             rows.add(row);
         });
         return rows;

@@ -33,5 +33,12 @@ public enum EventType {
     CS_INTERVENTION,        // 客服介入
     CS_CASE_CLOSED,         // 客服工单关闭
     DELIVERY_CANCELLED,     // 配送取消
-    RULE_UPDATED            // 物业规则变更（社区级事件，deliveryId 为空）
+    RULE_UPDATED,          // 物业规则变更（社区级事件，deliveryId 为空）
+    FULFILLMENT_DOWNGRADED,// 预计到达落入夜间限行，接单前改为门岗自提/人工配送
+    NIGHT_EXEMPTION_APPLIED,// 夜间药品临时放行生效（接单或进楼门禁命中）
+    NIGHT_ORDER_EXPEDITED, // 限行开始时机器人已在楼内，催办尽快完成当前订单
+    NIGHT_EXIT_PLANNED,    // 已生成夜间撤离计划（含结束时间与撤离路线）
+    NIGHT_EXITED,          // 机器人完成当前订单并按路线撤离楼栋
+    ARRIVED_AT_GATE,       // 门岗自提订单到达小区门岗，等待用户自取
+    MANUAL_DISPATCHED      // 人工配送订单派发夜间配送员
 }
